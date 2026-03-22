@@ -7,7 +7,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import folium
 from streamlit_folium import folium_static
-from shapely.geometry import Point, Polygon, LineString, box
+from shapely.geometry import Point, Polygon, LineString, box, MultiPolygon
 from shapely.ops import unary_union
 from shapely import concave_hull, convex_hull
 from pyproj import Transformer
@@ -108,18 +108,82 @@ def haversine(lat1, lon1, lat2, lon2):
     return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
 
 # ============================================================
+# BUG FIX: Dapatkan centroid WGS84 dari geometry apapun
+# (Point, Polygon, MultiPolygon, dll dari OSM)
+# ============================================================
+def get_centroid_latlon(geom):
+    """
+    Kembalikan (lat, lon) dari geometry apapun.
+    OSM sering mengembalikan Polygon/MultiPolygon untuk bangunan sekolah.
+    Tanpa ini, hasattr(geom, 'x') False → fasilitas tidak pernah terhitung.
+    """
+    try:
+        if geom is None or geom.is_empty:
+            return None, None
+        # Untuk Point langsung ambil koordinat
+        if geom.geom_type == 'Point':
+            return geom.y, geom.x
+        # Untuk Polygon, MultiPolygon, dll → ambil centroid
+        c = geom.centroid
+        return c.y, c.x
+    except:
+        return None, None
+
+# ============================================================
+# BUG FIX: Hitung luas polygon WGS84 dalam km²
+# Shapely .area pada WGS84 menghasilkan derajat² → perlu konversi
+# ============================================================
+def calc_area_sqkm_wgs84(polygon, ref_lat):
+    """
+    Konversi luas polygon WGS84 ke km² menggunakan faktor skala lokal.
+    """
+    try:
+        # Proyeksikan ke meter menggunakan UTM lokal
+        import pyproj
+        zone = int((ref_lat + 180) / 6) + 1
+        # Untuk Indonesia (lintang selatan) pakai zone selatan
+        epsg_utm = 32700 + zone if ref_lat < 0 else 32600 + zone
+        proj_in  = pyproj.CRS('EPSG:4326')
+        proj_out = pyproj.CRS(f'EPSG:{epsg_utm}')
+        transformer = Transformer.from_crs(proj_in, proj_out, always_xy=True)
+
+        if polygon.geom_type == 'Polygon':
+            coords_proj = [transformer.transform(x, y) for x, y in polygon.exterior.coords]
+            poly_proj   = Polygon(coords_proj)
+            return poly_proj.area / 1e6
+        elif polygon.geom_type == 'MultiPolygon':
+            total = 0
+            for p in polygon.geoms:
+                coords_proj = [transformer.transform(x, y) for x, y in p.exterior.coords]
+                total += Polygon(coords_proj).area
+            return total / 1e6
+        else:
+            # Fallback kasar
+            deg_area = polygon.area
+            m_per_deg_lat = 111320
+            m_per_deg_lon = 111320 * math.cos(math.radians(ref_lat))
+            return deg_area * m_per_deg_lat * m_per_deg_lon / 1e6
+    except:
+        return 0.0
+
+# ============================================================
 # CONVEX HULL (no scipy)
 # ============================================================
 def simple_convex_hull(points):
-    """Convex hull menggunakan shapely, tanpa scipy"""
     from shapely.geometry import MultiPoint
     mp = MultiPoint([(float(x), float(y)) for x, y in points])
     return convex_hull(mp)
 
 # ============================================================
-# AMBIL FASILITAS PENDIDIKAN OSM
+# BUG FIX: AMBIL FASILITAS PENDIDIKAN OSM
+# osmnx versi baru: features_from_bbox pakai (west,south,east,north) via bbox dict
+# atau tetap (north,south,east,west) positional — tapi perlu error handling lebih baik
 # ============================================================
 def get_education_facilities(bbox):
+    """
+    bbox = (north, south, east, west)
+    Coba berbagai format untuk kompatibilitas osmnx lama & baru.
+    """
     north, south, east, west = bbox
     tags_list = [
         {'amenity': 'school'},
@@ -128,14 +192,22 @@ def get_education_facilities(bbox):
         {'amenity': 'language_school'},
         {'amenity': 'driving_school'},
         {'amenity': 'music_school'},
+        {'amenity': 'kindergarten'},  # tambah TK
     ]
     collected = []
+
     for tags in tags_list:
         try:
-            f = ox.features_from_bbox((north, south, east, west), tags=tags)
+            # Coba format baru osmnx (bbox sebagai dict/tuple WSEN)
+            try:
+                f = ox.features_from_bbox(bbox=(west, south, east, north), tags=tags)
+            except TypeError:
+                # Fallback format lama (north, south, east, west)
+                f = ox.features_from_bbox(north, south, east, west, tags=tags)
+
             if not f.empty:
                 collected.append(f)
-        except:
+        except Exception:
             continue
 
     if not collected:
@@ -143,9 +215,27 @@ def get_education_facilities(bbox):
 
     combined = gpd.GeoDataFrame(pd.concat(collected, ignore_index=True))
     combined = combined.drop_duplicates(subset=['geometry'])
+
     if 'name' not in combined.columns:
         combined['name'] = 'Fasilitas Pendidikan'
+    else:
+        combined['name'] = combined['name'].fillna('Fasilitas Pendidikan')
+
     combined['edu_type'] = combined.apply(classify_edu, axis=1)
+
+    # BUG FIX: Normalisasi semua geometry ke centroid Point WGS84
+    # Ini krusial karena OSM mengembalikan campuran Point + Polygon + MultiPolygon
+    centroids = []
+    for geom in combined.geometry:
+        lat, lon = get_centroid_latlon(geom)
+        if lat is not None:
+            centroids.append(Point(lon, lat))
+        else:
+            centroids.append(None)
+    combined['centroid_geom'] = centroids
+    combined = combined[combined['centroid_geom'].notna()].copy()
+    combined['centroid_geom'] = gpd.GeoSeries(combined['centroid_geom'], crs='EPSG:4326')
+
     return combined
 
 # ============================================================
@@ -216,7 +306,6 @@ def calc_service_area(G, start_node, start_coords, max_dist, service_buffer=100)
         if not edges_geom:
             return None, []
 
-        # Deduplicate
         seen_pts = set()
         unique_pts = []
         for p in all_pts:
@@ -225,7 +314,6 @@ def calc_service_area(G, start_node, start_coords, max_dist, service_buffer=100)
                 seen_pts.add(k)
                 unique_pts.append(p)
 
-        # Build hull
         area = None
         if len(unique_pts) >= 3:
             try:
@@ -252,7 +340,6 @@ def calc_service_area(G, start_node, start_coords, max_dist, service_buffer=100)
         if area is None or area.is_empty:
             area = Point(start_coords).buffer(max_dist * 0.8)
 
-        # Smooth
         try:
             area = area.buffer(service_buffer, resolution=8)
             sp = Point(start_coords)
@@ -269,23 +356,31 @@ def calc_service_area(G, start_node, start_coords, max_dist, service_buffer=100)
         return None, []
 
 # ============================================================
-# BUFFER LANGSUNG
+# BUG FIX: BUFFER LANGSUNG — kembalikan dalam WGS84 derajat
+# dan simpan max_dist dalam meter untuk luas yang benar
 # ============================================================
 def calc_buffer(location_point, max_dist, shape='Lingkaran'):
+    """
+    Buat buffer dalam koordinat WGS84 (derajat).
+    max_dist dalam meter.
+    """
     lat, lon = location_point
     deg_lat  = max_dist / 111320
     deg_lon  = max_dist / (111320 * math.cos(math.radians(lat)))
+
     if shape == 'Persegi':
         return box(lon-deg_lon, lat-deg_lat, lon+deg_lon, lat+deg_lat)
     if shape == 'Kapsul':
         c1   = Point(lon-deg_lon/2, lat).buffer(deg_lat/2, resolution=8)
         c2   = Point(lon+deg_lon/2, lat).buffer(deg_lat/2, resolution=8)
         rect = box(lon-deg_lon/2, lat-deg_lat/3, lon+deg_lon/2, lat+deg_lat/3)
-        return unary_union([c1,c2,rect])
-    return Point(lon, lat).buffer(max_dist/111000, resolution=24)
+        return unary_union([c1, c2, rect])
+    # Lingkaran — buffer dalam derajat (rata-rata lat/lon)
+    deg_avg = (deg_lat + deg_lon) / 2
+    return Point(lon, lat).buffer(deg_avg, resolution=32)
 
 # ============================================================
-# KONVERSI POLYGON KE WGS84
+# KONVERSI POLYGON KE WGS84 (untuk hasil Service Area projected)
 # ============================================================
 def to_wgs84(polygon, crs, fallback_loc):
     try:
@@ -293,6 +388,12 @@ def to_wgs84(polygon, crs, fallback_loc):
         if hasattr(polygon, 'exterior'):
             coords = [transformer.transform(x,y) for x,y in polygon.exterior.coords]
             return Polygon(coords)
+        elif polygon.geom_type == 'MultiPolygon':
+            polys = []
+            for p in polygon.geoms:
+                coords = [transformer.transform(x,y) for x,y in p.exterior.coords]
+                polys.append(Polygon(coords))
+            return MultiPolygon(polys)
     except:
         pass
     lat, lon = fallback_loc
@@ -318,7 +419,6 @@ def run_analysis(location_point, network_type, speed_kmh, radius_m,
     pb = st.progress(0)
     status = st.empty()
 
-    # --- Jaringan ---
     G = start_node = start_coords = None
     if method != "Buffer dari Titik":
         status.text("🛣️ Mengambil jaringan jalan...")
@@ -334,66 +434,78 @@ def run_analysis(location_point, network_type, speed_kmh, radius_m,
             return None, None, None, None
         pb.progress(35)
 
-    # --- Fasilitas ---
-    status.text("🎓 Mencari fasilitas pendidikan...")
+    status.text("🎓 Mencari fasilitas pendidikan di OSM...")
     lat, lon = location_point
     R = 6378137
     dlat = (radius_m/R)*(180/math.pi)
     dlon = (radius_m/(R*math.cos(math.pi*lat/180)))*(180/math.pi)
     bbox = (lat+dlat, lat-dlat, lon+dlon, lon-dlon)
     edu_fac = get_education_facilities(bbox)
+
+    n_fac = len(edu_fac) if not edu_fac.empty else 0
+    status.text(f"🎓 Ditemukan {n_fac} fasilitas pendidikan di area pencarian...")
     pb.progress(50)
 
-    # --- Hitung zona ---
     status.text("🧮 Menghitung zona aksesibilitas...")
-    speed_mpm     = (speed_kmh * 1000) / 60
-    zones         = {}
-    edges_dict    = {}
-    service_buf   = kwargs.get('service_buffer', 100)
+    speed_mpm  = (speed_kmh * 1000) / 60
+    zones      = {}
+    edges_dict = {}
+    service_buf = kwargs.get('service_buffer', 100)
 
     for i, tl in enumerate(sorted(time_limits_min)):
         max_dist = speed_mpm * tl
 
         if method == "Buffer dari Titik":
-            poly_proj  = calc_buffer(location_point, max_dist, kwargs.get('buffer_shape','Lingkaran'))
-            poly_wgs   = poly_proj
+            poly_wgs   = calc_buffer(location_point, max_dist, kwargs.get('buffer_shape', 'Lingkaran'))
             edges_geom = []
+            # BUG FIX: Hitung luas dengan benar dalam km²
+            area_sqkm  = calc_area_sqkm_wgs84(poly_wgs, lat)
         else:
             poly_proj, edges_geom = calc_service_area(G, start_node, start_coords, max_dist, service_buf)
             if poly_proj is None:
-                poly_proj = calc_buffer(location_point, max_dist)
-                poly_wgs  = poly_proj
+                poly_wgs  = calc_buffer(location_point, max_dist)
                 edges_geom = []
+                area_sqkm  = calc_area_sqkm_wgs84(poly_wgs, lat)
             else:
-                poly_wgs = to_wgs84(poly_proj, G.graph['crs'], location_point)
+                # area_sqkm dari projected CRS (sudah dalam meter) — ini benar
+                area_sqkm = poly_proj.area / 1e6
+                poly_wgs  = to_wgs84(poly_proj, G.graph['crs'], location_point)
 
         if poly_wgs and not poly_wgs.is_empty:
             facs = []
             if not edu_fac.empty:
                 for _, row in edu_fac.iterrows():
                     try:
-                        if row.geometry and hasattr(row.geometry,'within') and row.geometry.within(poly_wgs):
-                            if hasattr(row.geometry,'x'):
-                                fy, fx = row.geometry.y, row.geometry.x
-                                d = haversine(lat, lon, fy, fx)
-                                facs.append({
-                                    'name':           str(row.get('name','Fasilitas Pendidikan')),
-                                    'amenity':        str(row.get('amenity','-')),
-                                    'edu_type':       str(row.get('edu_type','Lainnya')),
-                                    'distance_m':     d,
-                                    'travel_time_min': d / speed_mpm,
-                                    'coordinates':    (fy, fx),
-                                })
-                    except:
+                        # BUG FIX: Gunakan centroid_geom (sudah berupa Point WGS84)
+                        # bukan row.geometry yang bisa Polygon/MultiPolygon
+                        cgeom = row.get('centroid_geom')
+                        if cgeom is None or cgeom.is_empty:
+                            continue
+
+                        # Cek apakah centroid berada dalam zona
+                        if not cgeom.within(poly_wgs):
+                            continue
+
+                        fy, fx = cgeom.y, cgeom.x
+                        d = haversine(lat, lon, fy, fx)
+                        facs.append({
+                            'name':             str(row.get('name', 'Fasilitas Pendidikan')),
+                            'amenity':          str(row.get('amenity', '-')),
+                            'edu_type':         str(row.get('edu_type', 'Lainnya')),
+                            'distance_m':       d,
+                            'travel_time_min':  d / speed_mpm,
+                            'coordinates':      (fy, fx),
+                        })
+                    except Exception:
                         continue
 
             zones[tl] = {
-                'geometry':            poly_wgs,
-                'max_distance':        max_dist,
-                'area_sqkm':           poly_proj.area / 1e6,
-                'calculation_method':  method,
+                'geometry':              poly_wgs,
+                'max_distance':          max_dist,
+                'area_sqkm':             area_sqkm,
+                'calculation_method':    method,
                 'accessible_facilities': facs,
-                'facilities_count':    len(facs),
+                'facilities_count':      len(facs),
             }
             edges_dict[tl] = edges_geom
 
@@ -405,11 +517,11 @@ def run_analysis(location_point, network_type, speed_kmh, radius_m,
     status.empty()
 
     result = (G, edu_fac, zones, edges_dict)
-    st.session_state.analysis_results  = result
-    st.session_state.analysis_params   = params
+    st.session_state.analysis_results    = result
+    st.session_state.analysis_params     = params
     st.session_state.accessibility_zones = zones
     st.session_state.education_facilities = edu_fac
-    st.session_state.reachable_edges   = edges_dict
+    st.session_state.reachable_edges     = edges_dict
     st.session_state.analysis_in_progress = False
     return result
 
@@ -428,44 +540,51 @@ def build_map(loc, zones, edu_fac, edges_dict):
         icon=folium.Icon(color='red', icon='bullseye', prefix='fa')
     ).add_to(m)
 
-    # Edges jaringan
     if edges_dict:
         for tl, edges in edges_dict.items():
-            color = ZONE_COLORS.get(tl,'#90CAF9')
+            color = ZONE_COLORS.get(tl, '#90CAF9')
             for eg in edges:
                 try:
-                    coords = [[y,x] for x,y in eg.coords]
+                    coords = [[y, x] for x, y in eg.coords]
                     if len(coords) >= 2:
                         folium.PolyLine(coords, color=color, weight=1, opacity=0.25).add_to(m)
                 except:
                     continue
 
-    # Zona
     for tl, zd in zones.items():
-        color = ZONE_COLORS.get(tl,'#90CAF9')
+        color = ZONE_COLORS.get(tl, '#90CAF9')
         try:
             poly = zd['geometry']
-            if hasattr(poly,'exterior'):
-                pts = [[lat,lon] for lon,lat in poly.exterior.coords]
-                if len(pts) >= 3:
+            if poly.geom_type == 'Polygon' and len(list(poly.exterior.coords)) >= 3:
+                pts = [[lat, lon] for lon, lat in poly.exterior.coords]
+                folium.Polygon(
+                    pts, color=color, fill=True,
+                    fill_color=color, fill_opacity=0.3, weight=2,
+                    popup=(f"<b>{tl} menit</b><br>"
+                           f"Luas: {zd['area_sqkm']:.2f} km²<br>"
+                           f"Fasilitas: {zd['facilities_count']}"),
+                    tooltip=f"Zona {tl} menit"
+                ).add_to(m)
+            elif poly.geom_type == 'MultiPolygon':
+                for p in poly.geoms:
+                    pts = [[lat, lon] for lon, lat in p.exterior.coords]
                     folium.Polygon(
                         pts, color=color, fill=True,
                         fill_color=color, fill_opacity=0.3, weight=2,
-                        popup=f"<b>{tl} menit</b><br>Luas: {zd['area_sqkm']:.2f} km²<br>Fasilitas: {zd['facilities_count']}",
                         tooltip=f"Zona {tl} menit"
                     ).add_to(m)
         except:
             folium.Circle(loc, radius=zd['max_distance'], color=color,
                           fill=True, fill_color=color, fill_opacity=0.3).add_to(m)
 
-    # Marker fasilitas
     added = set()
     for tl, zd in zones.items():
-        for fac in zd.get('accessible_facilities',[]):
+        for fac in zd.get('accessible_facilities', []):
             key = f"{fac['coordinates'][0]:.5f},{fac['coordinates'][1]:.5f}"
-            if key in added: continue
+            if key in added:
+                continue
             added.add(key)
-            color, icon = EDU_MARKER.get(fac['edu_type'], ('gray','info-circle'))
+            color, icon = EDU_MARKER.get(fac['edu_type'], ('gray', 'info-circle'))
             folium.Marker(
                 fac['coordinates'],
                 popup=folium.Popup(
@@ -476,7 +595,6 @@ def build_map(loc, zones, edu_fac, edges_dict):
                 icon=folium.Icon(color=color, icon=icon, prefix='fa')
             ).add_to(m)
 
-    # Legenda
     legend = """
     <div style="position:fixed;bottom:50px;left:50px;width:210px;
                 background:white;border:2px solid grey;z-index:9999;
@@ -514,7 +632,7 @@ def show_results(loc, G, edu_fac, zones, edges_dict, method, speed, radius, time
 
     with tab2:
         st.subheader("📊 Dashboard")
-        c1,c2,c3,c4 = st.columns(4)
+        c1, c2, c3, c4 = st.columns(4)
         with c1:
             st.metric("🎓 Total Fasilitas di Area",
                       edu_fac.shape[0] if not edu_fac.empty else 0)
@@ -529,7 +647,7 @@ def show_results(loc, G, edu_fac, zones, edges_dict, method, speed, radius, time
         if not edu_fac.empty and 'edu_type' in edu_fac.columns:
             st.subheader("Distribusi Jenis Fasilitas dalam Area Pencarian")
             tc = edu_fac['edu_type'].value_counts().reset_index()
-            tc.columns = ['Jenjang','Jumlah']
+            tc.columns = ['Jenjang', 'Jumlah']
             st.dataframe(tc, use_container_width=True, hide_index=True)
 
         if zones:
@@ -537,14 +655,14 @@ def show_results(loc, G, edu_fac, zones, edges_dict, method, speed, radius, time
             rows = []
             for tl, zd in sorted(zones.items()):
                 rows.append({
-                    "⏱️ Waktu": f"{tl} menit",
+                    "⏱️ Waktu":      f"{tl} menit",
                     "📏 Jarak Maks": f"{zd['max_distance']:.0f} m",
-                    "📐 Luas": f"{zd['area_sqkm']:.2f} km²",
-                    "🎓 Fasilitas": zd['facilities_count']
+                    "📐 Luas":       f"{zd['area_sqkm']:.2f} km²",
+                    "🎓 Fasilitas":  zd['facilities_count']
                 })
             st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
-            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12,4))
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
             tl_list = sorted(zones.keys())
             areas   = [zones[t]['area_sqkm'] for t in tl_list]
             counts  = [zones[t]['facilities_count'] for t in tl_list]
@@ -554,7 +672,7 @@ def show_results(loc, G, edu_fac, zones, edges_dict, method, speed, radius, time
             ax1.set_title('Luas Area vs Waktu Tempuh', fontweight='bold')
             ax1.set_xlabel('Waktu (menit)'); ax1.set_ylabel('km²')
             ax1.grid(axis='y', alpha=0.3)
-            for bar,v in zip(ax1.patches, areas):
+            for bar, v in zip(ax1.patches, areas):
                 ax1.text(bar.get_x()+bar.get_width()/2, bar.get_height(),
                          f'{v:.2f}', ha='center', va='bottom', fontsize=9)
 
@@ -562,7 +680,7 @@ def show_results(loc, G, edu_fac, zones, edges_dict, method, speed, radius, time
             ax2.set_title('Fasilitas Pendidikan Terjangkau', fontweight='bold')
             ax2.set_xlabel('Waktu (menit)'); ax2.set_ylabel('Jumlah')
             ax2.grid(axis='y', alpha=0.3)
-            for bar,v in zip(ax2.patches, counts):
+            for bar, v in zip(ax2.patches, counts):
                 ax2.text(bar.get_x()+bar.get_width()/2, bar.get_height(),
                          str(v), ha='center', va='bottom', fontsize=9)
             plt.tight_layout()
@@ -573,27 +691,25 @@ def show_results(loc, G, edu_fac, zones, edges_dict, method, speed, radius, time
         any_fac = any(z['accessible_facilities'] for z in zones.values())
         if any_fac:
             for tl in sorted(time_limits):
-                if tl not in zones: continue
+                if tl not in zones:
+                    continue
                 facs = zones[tl]['accessible_facilities']
                 with st.expander(f"Zona {tl} menit — {len(facs)} fasilitas", expanded=False):
                     if facs:
                         df = pd.DataFrame([{
-                            "Nama":     f['name'][:50],
-                            "Jenjang":  f['edu_type'],
-                            "Amenity":  f['amenity'],
-                            "Jarak (m)":f"{f['distance_m']:.0f}",
-                            "Waktu":    f"{f['travel_time_min']:.1f} mnt",
+                            "Nama":      f['name'][:50],
+                            "Jenjang":   f['edu_type'],
+                            "Amenity":   f['amenity'],
+                            "Jarak (m)": f"{f['distance_m']:.0f}",
+                            "Waktu":     f"{f['travel_time_min']:.1f} mnt",
                         } for f in facs])
                         st.dataframe(df, use_container_width=True, hide_index=True)
-
-                        # Ringkasan per jenjang
                         summ = df.groupby('Jenjang').size().reset_index(name='Jumlah')
                         st.caption("Ringkasan per jenjang:")
                         st.dataframe(summ, use_container_width=True, hide_index=True)
-
                         csv = df.to_csv(index=False).encode('utf-8')
                         st.download_button(f"📥 Download CSV zona {tl} menit", csv,
-                                           f"fasdik_{tl}mnt.csv","text/csv",
+                                           f"fasdik_{tl}mnt.csv", "text/csv",
                                            key=f"dl_{tl}")
                     else:
                         st.info("Tidak ada fasilitas dalam zona ini.")
@@ -606,26 +722,24 @@ def show_results(loc, G, edu_fac, zones, edges_dict, method, speed, radius, time
         if all_facs:
             times = [f['travel_time_min'] for f in all_facs]
             dists = [f['distance_m'] for f in all_facs]
-            c1,c2,c3,c4 = st.columns(4)
-            with c1: st.metric("Fasilitas Unik", len({f['name'] for f in all_facs}))
-            with c2: st.metric("Rata-rata Waktu", f"{np.mean(times):.1f} mnt")
-            with c3: st.metric("Rata-rata Jarak", f"{np.mean(dists):.0f} m")
-            with c4: st.metric("Waktu Terdekat",  f"{min(times):.1f} mnt")
+            c1, c2, c3, c4 = st.columns(4)
+            with c1: st.metric("Fasilitas Unik",    len({f['name'] for f in all_facs}))
+            with c2: st.metric("Rata-rata Waktu",   f"{np.mean(times):.1f} mnt")
+            with c3: st.metric("Rata-rata Jarak",   f"{np.mean(dists):.0f} m")
+            with c4: st.metric("Waktu Terdekat",    f"{min(times):.1f} mnt")
 
-            # Distribusi per jenjang
             type_cnt = {}
             for f in all_facs:
-                type_cnt[f['edu_type']] = type_cnt.get(f['edu_type'],0) + 1
-            fig3, ax3 = plt.subplots(figsize=(10,4))
+                type_cnt[f['edu_type']] = type_cnt.get(f['edu_type'], 0) + 1
+            fig3, ax3 = plt.subplots(figsize=(10, 4))
             ax3.bar(list(type_cnt.keys()), list(type_cnt.values()),
-                    color=plt.cm.Set2(np.linspace(0,1,len(type_cnt))), edgecolor='black')
+                    color=plt.cm.Set2(np.linspace(0, 1, len(type_cnt))), edgecolor='black')
             ax3.set_title('Distribusi Fasilitas per Jenjang', fontweight='bold')
             ax3.set_xlabel('Jenjang'); ax3.set_ylabel('Jumlah')
             ax3.grid(axis='y', alpha=0.3)
             plt.tight_layout(); st.pyplot(fig3)
 
-            # Histogram waktu tempuh
-            fig4, ax4 = plt.subplots(figsize=(10,4))
+            fig4, ax4 = plt.subplots(figsize=(10, 4))
             ax4.hist(times, bins=15, color='steelblue', edgecolor='black', alpha=0.7)
             ax4.set_title('Distribusi Waktu Tempuh ke Fasilitas Pendidikan', fontweight='bold')
             ax4.set_xlabel('Waktu (menit)'); ax4.set_ylabel('Jumlah Fasilitas')
@@ -636,12 +750,12 @@ def show_results(loc, G, edu_fac, zones, edges_dict, method, speed, radius, time
 
         st.subheader("💾 Ekspor Ringkasan")
         summ = pd.DataFrame([{
-            'Waktu_menit': tl,
-            'Metode': z['calculation_method'],
-            'Jarak_maks_m': z['max_distance'],
-            'Luas_km2': z['area_sqkm'],
-            'Jumlah_fasilitas': z['facilities_count']
-        } for tl,z in zones.items()])
+            'Waktu_menit':        tl,
+            'Metode':             z['calculation_method'],
+            'Jarak_maks_m':       z['max_distance'],
+            'Luas_km2':           z['area_sqkm'],
+            'Jumlah_fasilitas':   z['facilities_count']
+        } for tl, z in zones.items()])
         st.download_button("📥 Download Ringkasan CSV",
                            summ.to_csv(index=False).encode('utf-8'),
                            "ringkasan_aksesibilitas_pendidikan.csv",
@@ -651,7 +765,7 @@ def show_results(loc, G, edu_fac, zones, edges_dict, method, speed, radius, time
 # HALAMAN WELCOME
 # ============================================================
 def welcome():
-    col1, col2 = st.columns([2,1])
+    col1, col2 = st.columns([2, 1])
     with col1:
         st.markdown("""
         ## 📋 Panduan Penggunaan
@@ -689,13 +803,17 @@ def welcome():
 with st.sidebar:
     st.header("📍 Titik Analisis")
 
-    mode = st.radio("Input:", ["Pilih Kota","Koordinat Manual"], key="input_mode")
+    mode = st.radio("Input:", ["Pilih Kota", "Koordinat Manual"], key="input_mode")
     KOTA = {
-        "Malang":(-7.9819,112.6200),"Jakarta":(-6.2088,106.8456),
-        "Bandung":(-6.9175,107.6191),"Surabaya":(-7.2575,112.7521),
-        "Yogyakarta":(-7.7956,110.3695),"Semarang":(-6.9667,110.4167),
-        "Denpasar":(-8.6705,115.2126),"Medan":(3.5952,98.6722),
-        "Makassar":(-5.1477,119.4327)
+        "Malang":     (-7.9819, 112.6200),
+        "Jakarta":    (-6.2088, 106.8456),
+        "Bandung":    (-6.9175, 107.6191),
+        "Surabaya":   (-7.2575, 112.7521),
+        "Yogyakarta": (-7.7956, 110.3695),
+        "Semarang":   (-6.9667, 110.4167),
+        "Denpasar":   (-8.6705, 115.2126),
+        "Medan":      ( 3.5952,  98.6722),
+        "Makassar":   (-5.1477, 119.4327),
     }
     if mode == "Pilih Kota":
         city = st.selectbox("Kota:", list(KOTA.keys()), key="city")
@@ -709,22 +827,22 @@ with st.sidebar:
 
     st.subheader("⚙️ Pengaturan")
     mode_id  = st.selectbox("Mode Transportasi:",
-                            ["jalan kaki","sepeda","mobil/motor"], index=2, key="mode_id")
+                            ["jalan kaki", "sepeda", "mobil/motor"], index=2, key="mode_id")
     net_type = convert_mode(mode_id)
     speed    = st.slider("Kecepatan (km/jam):", 1.0, 100.0,
                          default_speed(mode_id), 0.5, key="speed")
     radius   = st.slider("Radius Pencarian (m):", 500, 20000, 2000, 100, key="radius")
     t_limits = st.multiselect("Batas Waktu (menit):",
-                              [5,10,15,20,25,30,45,60], default=[15,25], key="t_limits")
+                              [5, 10, 15, 20, 25, 30, 45, 60], default=[15, 25], key="t_limits")
     method   = st.selectbox("Metode Coverage:",
-                            ["Service Area","Buffer dari Titik"], key="method")
+                            ["Service Area", "Buffer dari Titik"], key="method")
 
     extra = {}
     if method == "Service Area":
         extra['service_buffer'] = st.slider("Buffer Service Area (m):", 20, 2000, 100, 10, key="sbuf")
     else:
         extra['buffer_shape'] = st.selectbox("Bentuk Buffer:",
-                                             ["Lingkaran","Persegi","Kapsul"], key="bshape")
+                                             ["Lingkaran", "Persegi", "Kapsul"], key="bshape")
     extra['mode_bahasa'] = mode_id
 
     run_btn   = st.button("🚀 Jalankan Analisis", type="primary",
@@ -732,7 +850,7 @@ with st.sidebar:
     reset_btn = st.button("🔄 Reset", use_container_width=True, key="reset")
 
     if reset_btn:
-        for k,v in _defaults.items():
+        for k, v in _defaults.items():
             st.session_state[k] = v
         st.rerun()
 
@@ -763,8 +881,8 @@ elif st.session_state.analysis_results and st.session_state.accessibility_zones:
         p.get('location', loc), G, edu_fac, zones, edges_dict,
         p.get('method', method), p.get('speed', speed),
         p.get('radius', radius), list(p.get('time_limits', t_limits)),
-        **{k:v for k,v in p.items()
-           if k not in ('location','network_type','speed','radius','time_limits','method')}
+        **{k: v for k, v in p.items()
+           if k not in ('location', 'network_type', 'speed', 'radius', 'time_limits', 'method')}
     )
 elif not run_btn:
     welcome()
@@ -775,7 +893,7 @@ elif not run_btn:
 st.markdown("---")
 st.markdown("""
 <div style='text-align:center;padding:15px;color:#7f8c8d;font-size:0.85em;'>
-🎓📍 <b>Aksesibilitas Fasilitas Pendidikan</b> v6.1 &nbsp;|&nbsp;
+🎓📍 <b>Aksesibilitas Fasilitas Pendidikan</b> v6.2 &nbsp;|&nbsp;
 Dijkstra + Concave Hull (Shapely) &nbsp;|&nbsp;
 Data: © OpenStreetMap contributors &nbsp;|&nbsp; 2026<br>
 Developer: <b>Adipandang Yudono, S.Si., MURP., PhD</b>
