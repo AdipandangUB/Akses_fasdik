@@ -531,10 +531,20 @@ def run_analysis(location_point, network_type, speed_kmh, radius_m,
 ZONE_COLORS = {5:'#E3F2FD',10:'#BBDEFB',15:'#90CAF9',20:'#64B5F6',
                25:'#42A5F5',30:'#2196F3',45:'#1565C0',60:'#0D47A1'}
 
-def build_map(loc, zones, edu_fac, edges_dict):
-    m = folium.Map(location=loc, zoom_start=14, tiles='OpenStreetMap', control_scale=True)
+def build_map(center_loc, zones, edu_fac, edges_dict):
+    # BUG FIX v6.3: Pecah center_loc menjadi center_lat/center_lon eksplisit.
+    # Kode lama pakai 'loc' lalu list comprehension [[lat,lon] for lon,lat in ...]
+    # yang membuat variabel 'lat' dan 'lon' di scope fungsi tertimpa nilai
+    # terakhir dari koordinat polygon → Map terpusat ke koordinat salah → peta kosong.
+    center_lat, center_lon = center_loc
 
-    folium.Marker(loc,
+    m = folium.Map(
+        location=[center_lat, center_lon],
+        zoom_start=14, tiles='OpenStreetMap', control_scale=True
+    )
+
+    folium.Marker(
+        [center_lat, center_lon],
         popup='<b>📍 Titik Analisis</b>',
         tooltip='Titik Analisis',
         icon=folium.Icon(color='red', icon='bullseye', prefix='fa')
@@ -542,58 +552,73 @@ def build_map(loc, zones, edu_fac, edges_dict):
 
     if edges_dict:
         for tl, edges in edges_dict.items():
-            color = ZONE_COLORS.get(tl, '#90CAF9')
+            edge_color = ZONE_COLORS.get(tl, '#90CAF9')
             for eg in edges:
                 try:
-                    coords = [[y, x] for x, y in eg.coords]
-                    if len(coords) >= 2:
-                        folium.PolyLine(coords, color=color, weight=1, opacity=0.25).add_to(m)
+                    # _ex/_ey: nama unik agar tidak shadow center_lat/center_lon
+                    edge_pts = [[_ey, _ex] for _ex, _ey in eg.coords]
+                    if len(edge_pts) >= 2:
+                        folium.PolyLine(edge_pts, color=edge_color, weight=1, opacity=0.25).add_to(m)
                 except:
                     continue
 
     for tl, zd in zones.items():
-        color = ZONE_COLORS.get(tl, '#90CAF9')
+        zone_color = ZONE_COLORS.get(tl, '#90CAF9')
         try:
             poly = zd['geometry']
+            if poly is None or poly.is_empty:
+                raise ValueError("empty")
             if poly.geom_type == 'Polygon' and len(list(poly.exterior.coords)) >= 3:
-                pts = [[lat, lon] for lon, lat in poly.exterior.coords]
+                # BUG FIX: Gunakan _plat/_plon, BUKAN lat/lon
+                # Kode lama: [[lat,lon] for lon,lat in ...] → menimpa variabel loc
+                pts = [[_plat, _plon] for _plon, _plat in poly.exterior.coords]
                 folium.Polygon(
-                    pts, color=color, fill=True,
-                    fill_color=color, fill_opacity=0.3, weight=2,
+                    pts, color=zone_color, fill=True,
+                    fill_color=zone_color, fill_opacity=0.3, weight=2,
                     popup=(f"<b>{tl} menit</b><br>"
                            f"Luas: {zd['area_sqkm']:.2f} km²<br>"
                            f"Fasilitas: {zd['facilities_count']}"),
                     tooltip=f"Zona {tl} menit"
                 ).add_to(m)
             elif poly.geom_type == 'MultiPolygon':
-                for p in poly.geoms:
-                    pts = [[lat, lon] for lon, lat in p.exterior.coords]
+                for sub_p in poly.geoms:
+                    pts = [[_plat, _plon] for _plon, _plat in sub_p.exterior.coords]
                     folium.Polygon(
-                        pts, color=color, fill=True,
-                        fill_color=color, fill_opacity=0.3, weight=2,
+                        pts, color=zone_color, fill=True,
+                        fill_color=zone_color, fill_opacity=0.3, weight=2,
                         tooltip=f"Zona {tl} menit"
                     ).add_to(m)
-        except:
-            folium.Circle(loc, radius=zd['max_distance'], color=color,
-                          fill=True, fill_color=color, fill_opacity=0.3).add_to(m)
+            else:
+                raise ValueError("unknown type")
+        except Exception:
+            # Fallback: Circle di titik pusat yang terjaga — center_lat/center_lon
+            folium.Circle(
+                [center_lat, center_lon],
+                radius=zd['max_distance'], color=zone_color,
+                fill=True, fill_color=zone_color, fill_opacity=0.3,
+                tooltip=f"Zona {tl} menit (estimasi)"
+            ).add_to(m)
 
     added = set()
     for tl, zd in zones.items():
         for fac in zd.get('accessible_facilities', []):
-            key = f"{fac['coordinates'][0]:.5f},{fac['coordinates'][1]:.5f}"
-            if key in added:
+            fkey = f"{fac['coordinates'][0]:.5f},{fac['coordinates'][1]:.5f}"
+            if fkey in added:
                 continue
-            added.add(key)
-            color, icon = EDU_MARKER.get(fac['edu_type'], ('gray', 'info-circle'))
-            folium.Marker(
-                fac['coordinates'],
-                popup=folium.Popup(
-                    f"<b>{fac['name']}</b><br>Jenjang: {fac['edu_type']}<br>"
-                    f"Jarak: {fac['distance_m']:.0f} m<br>Waktu: {fac['travel_time_min']:.1f} mnt",
-                    max_width=250),
-                tooltip=f"{fac['name']} ({fac['edu_type']})",
-                icon=folium.Icon(color=color, icon=icon, prefix='fa')
-            ).add_to(m)
+            added.add(fkey)
+            fcolor, ficon = EDU_MARKER.get(fac['edu_type'], ('gray', 'info-circle'))
+            try:
+                folium.Marker(
+                    fac['coordinates'],
+                    popup=folium.Popup(
+                        f"<b>{fac['name']}</b><br>Jenjang: {fac['edu_type']}<br>"
+                        f"Jarak: {fac['distance_m']:.0f} m<br>Waktu: {fac['travel_time_min']:.1f} mnt",
+                        max_width=250),
+                    tooltip=f"{fac['name']} ({fac['edu_type']})",
+                    icon=folium.Icon(color=fcolor, icon=ficon, prefix='fa')
+                ).add_to(m)
+            except Exception:
+                continue
 
     legend = """
     <div style="position:fixed;bottom:50px;left:50px;width:210px;
@@ -627,8 +652,24 @@ def show_results(loc, G, edu_fac, zones, edges_dict, method, speed, radius, time
     with tab1:
         st.subheader("🗺️ Peta Jangkauan Fasilitas Pendidikan")
         st.info(f"**📍 Titik:** {loc[0]:.6f}, {loc[1]:.6f} | **Metode:** {method}")
-        m = build_map(loc, zones, edu_fac, edges_dict)
-        folium_static(m, width=1200, height=620)
+        try:
+            m = build_map(loc, zones, edu_fac, edges_dict)
+            folium_static(m, width=1200, height=620)
+        except Exception as map_err:
+            st.error(f"❌ Gagal render peta: {map_err}")
+            try:
+                m_fb = folium.Map(location=list(loc), zoom_start=14)
+                folium.Marker(list(loc), tooltip="Titik Analisis",
+                              icon=folium.Icon(color="red")).add_to(m_fb)
+                for tl, zd in zones.items():
+                    zc = ZONE_COLORS.get(tl, "#90CAF9")
+                    folium.Circle(list(loc), radius=zd["max_distance"],
+                                  color=zc, fill=True, fill_color=zc,
+                                  fill_opacity=0.3, tooltip=f"Zona {tl} menit").add_to(m_fb)
+                folium_static(m_fb, width=1200, height=620)
+                st.warning("⚠️ Ditampilkan peta sederhana (fallback mode).")
+            except Exception as fb_err:
+                st.error(f"❌ Fallback peta gagal: {fb_err}")
 
     with tab2:
         st.subheader("📊 Dashboard")
