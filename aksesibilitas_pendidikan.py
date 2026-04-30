@@ -6,7 +6,7 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import folium
-from streamlit_folium import folium_static
+from streamlit_folium import st_folium   # FIX: pakai st_folium bukan folium_static
 from shapely.geometry import Point, Polygon, LineString, box, MultiPolygon
 from shapely.ops import unary_union
 from shapely import concave_hull, convex_hull
@@ -108,49 +108,33 @@ def haversine(lat1, lon1, lat2, lon2):
     return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
 
 # ============================================================
-# BUG FIX: Dapatkan centroid WGS84 dari geometry apapun
-# (Point, Polygon, MultiPolygon, dll dari OSM)
+# CENTROID WGS84
 # ============================================================
 def get_centroid_latlon(geom):
-    """
-    Kembalikan (lat, lon) dari geometry apapun.
-    OSM sering mengembalikan Polygon/MultiPolygon untuk bangunan sekolah.
-    Tanpa ini, hasattr(geom, 'x') False → fasilitas tidak pernah terhitung.
-    """
     try:
         if geom is None or geom.is_empty:
             return None, None
-        # Untuk Point langsung ambil koordinat
         if geom.geom_type == 'Point':
             return geom.y, geom.x
-        # Untuk Polygon, MultiPolygon, dll → ambil centroid
         c = geom.centroid
         return c.y, c.x
     except:
         return None, None
 
 # ============================================================
-# BUG FIX: Hitung luas polygon WGS84 dalam km²
-# Shapely .area pada WGS84 menghasilkan derajat² → perlu konversi
+# LUAS POLYGON WGS84 → km²
 # ============================================================
 def calc_area_sqkm_wgs84(polygon, ref_lat):
-    """
-    Konversi luas polygon WGS84 ke km² menggunakan faktor skala lokal.
-    """
     try:
-        # Proyeksikan ke meter menggunakan UTM lokal
         import pyproj
         zone = int((ref_lat + 180) / 6) + 1
-        # Untuk Indonesia (lintang selatan) pakai zone selatan
         epsg_utm = 32700 + zone if ref_lat < 0 else 32600 + zone
         proj_in  = pyproj.CRS('EPSG:4326')
         proj_out = pyproj.CRS(f'EPSG:{epsg_utm}')
         transformer = Transformer.from_crs(proj_in, proj_out, always_xy=True)
-
         if polygon.geom_type == 'Polygon':
             coords_proj = [transformer.transform(x, y) for x, y in polygon.exterior.coords]
-            poly_proj   = Polygon(coords_proj)
-            return poly_proj.area / 1e6
+            return Polygon(coords_proj).area / 1e6
         elif polygon.geom_type == 'MultiPolygon':
             total = 0
             for p in polygon.geoms:
@@ -158,7 +142,6 @@ def calc_area_sqkm_wgs84(polygon, ref_lat):
                 total += Polygon(coords_proj).area
             return total / 1e6
         else:
-            # Fallback kasar
             deg_area = polygon.area
             m_per_deg_lat = 111320
             m_per_deg_lon = 111320 * math.cos(math.radians(ref_lat))
@@ -167,7 +150,7 @@ def calc_area_sqkm_wgs84(polygon, ref_lat):
         return 0.0
 
 # ============================================================
-# CONVEX HULL (no scipy)
+# CONVEX HULL
 # ============================================================
 def simple_convex_hull(points):
     from shapely.geometry import MultiPoint
@@ -175,15 +158,9 @@ def simple_convex_hull(points):
     return convex_hull(mp)
 
 # ============================================================
-# BUG FIX: AMBIL FASILITAS PENDIDIKAN OSM
-# osmnx versi baru: features_from_bbox pakai (west,south,east,north) via bbox dict
-# atau tetap (north,south,east,west) positional — tapi perlu error handling lebih baik
+# AMBIL FASILITAS PENDIDIKAN OSM
 # ============================================================
 def get_education_facilities(bbox):
-    """
-    bbox = (north, south, east, west)
-    Coba berbagai format untuk kompatibilitas osmnx lama & baru.
-    """
     north, south, east, west = bbox
     tags_list = [
         {'amenity': 'school'},
@@ -192,19 +169,15 @@ def get_education_facilities(bbox):
         {'amenity': 'language_school'},
         {'amenity': 'driving_school'},
         {'amenity': 'music_school'},
-        {'amenity': 'kindergarten'},  # tambah TK
+        {'amenity': 'kindergarten'},
     ]
     collected = []
-
     for tags in tags_list:
         try:
-            # Coba format baru osmnx (bbox sebagai dict/tuple WSEN)
             try:
                 f = ox.features_from_bbox(bbox=(west, south, east, north), tags=tags)
             except TypeError:
-                # Fallback format lama (north, south, east, west)
                 f = ox.features_from_bbox(north, south, east, west, tags=tags)
-
             if not f.empty:
                 collected.append(f)
         except Exception:
@@ -223,8 +196,6 @@ def get_education_facilities(bbox):
 
     combined['edu_type'] = combined.apply(classify_edu, axis=1)
 
-    # BUG FIX: Normalisasi semua geometry ke centroid Point WGS84
-    # Ini krusial karena OSM mengembalikan campuran Point + Polygon + MultiPolygon
     centroids = []
     for geom in combined.geometry:
         lat, lon = get_centroid_latlon(geom)
@@ -235,7 +206,6 @@ def get_education_facilities(bbox):
     combined['centroid_geom'] = centroids
     combined = combined[combined['centroid_geom'].notna()].copy()
     combined['centroid_geom'] = gpd.GeoSeries(combined['centroid_geom'], crs='EPSG:4326')
-
     return combined
 
 # ============================================================
@@ -269,7 +239,7 @@ def nearest_node(G, location_point):
         return None, None, None
 
 # ============================================================
-# SERVICE AREA (CONCAVE / CONVEX HULL)
+# SERVICE AREA
 # ============================================================
 def calc_service_area(G, start_node, start_coords, max_dist, service_buffer=100):
     try:
@@ -287,12 +257,10 @@ def calc_service_area(G, start_node, start_coords, max_dist, service_buffer=100)
             dv = dist_map.get(v, float('inf'))
             if du > max_dist and dv > max_dist:
                 continue
-
             for n in (u, v):
                 if n not in seen_nodes:
                     seen_nodes.add(n)
                     all_pts.append((G.nodes[n]['x'], G.nodes[n]['y']))
-
             if 'geometry' in data:
                 geom = data['geometry']
                 all_pts.extend(list(geom.coords))
@@ -356,18 +324,12 @@ def calc_service_area(G, start_node, start_coords, max_dist, service_buffer=100)
         return None, []
 
 # ============================================================
-# BUG FIX: BUFFER LANGSUNG — kembalikan dalam WGS84 derajat
-# dan simpan max_dist dalam meter untuk luas yang benar
+# BUFFER LANGSUNG
 # ============================================================
 def calc_buffer(location_point, max_dist, shape='Lingkaran'):
-    """
-    Buat buffer dalam koordinat WGS84 (derajat).
-    max_dist dalam meter.
-    """
     lat, lon = location_point
     deg_lat  = max_dist / 111320
     deg_lon  = max_dist / (111320 * math.cos(math.radians(lat)))
-
     if shape == 'Persegi':
         return box(lon-deg_lon, lat-deg_lat, lon+deg_lon, lat+deg_lat)
     if shape == 'Kapsul':
@@ -375,12 +337,11 @@ def calc_buffer(location_point, max_dist, shape='Lingkaran'):
         c2   = Point(lon+deg_lon/2, lat).buffer(deg_lat/2, resolution=8)
         rect = box(lon-deg_lon/2, lat-deg_lat/3, lon+deg_lon/2, lat+deg_lat/3)
         return unary_union([c1, c2, rect])
-    # Lingkaran — buffer dalam derajat (rata-rata lat/lon)
     deg_avg = (deg_lat + deg_lon) / 2
     return Point(lon, lat).buffer(deg_avg, resolution=32)
 
 # ============================================================
-# KONVERSI POLYGON KE WGS84 (untuk hasil Service Area projected)
+# KONVERSI KE WGS84
 # ============================================================
 def to_wgs84(polygon, crs, fallback_loc):
     try:
@@ -458,7 +419,6 @@ def run_analysis(location_point, network_type, speed_kmh, radius_m,
         if method == "Buffer dari Titik":
             poly_wgs   = calc_buffer(location_point, max_dist, kwargs.get('buffer_shape', 'Lingkaran'))
             edges_geom = []
-            # BUG FIX: Hitung luas dengan benar dalam km²
             area_sqkm  = calc_area_sqkm_wgs84(poly_wgs, lat)
         else:
             poly_proj, edges_geom = calc_service_area(G, start_node, start_coords, max_dist, service_buf)
@@ -467,7 +427,6 @@ def run_analysis(location_point, network_type, speed_kmh, radius_m,
                 edges_geom = []
                 area_sqkm  = calc_area_sqkm_wgs84(poly_wgs, lat)
             else:
-                # area_sqkm dari projected CRS (sudah dalam meter) — ini benar
                 area_sqkm = poly_proj.area / 1e6
                 poly_wgs  = to_wgs84(poly_proj, G.graph['crs'], location_point)
 
@@ -476,16 +435,11 @@ def run_analysis(location_point, network_type, speed_kmh, radius_m,
             if not edu_fac.empty:
                 for _, row in edu_fac.iterrows():
                     try:
-                        # BUG FIX: Gunakan centroid_geom (sudah berupa Point WGS84)
-                        # bukan row.geometry yang bisa Polygon/MultiPolygon
                         cgeom = row.get('centroid_geom')
                         if cgeom is None or cgeom.is_empty:
                             continue
-
-                        # Cek apakah centroid berada dalam zona
                         if not cgeom.within(poly_wgs):
                             continue
-
                         fy, fx = cgeom.y, cgeom.x
                         d = haversine(lat, lon, fy, fx)
                         facs.append({
@@ -532,17 +486,17 @@ ZONE_COLORS = {5:'#E3F2FD',10:'#BBDEFB',15:'#90CAF9',20:'#64B5F6',
                25:'#42A5F5',30:'#2196F3',45:'#1565C0',60:'#0D47A1'}
 
 def build_map(center_loc, zones, edu_fac, edges_dict):
-    # BUG FIX v6.3: Pecah center_loc menjadi center_lat/center_lon eksplisit.
-    # Kode lama pakai 'loc' lalu list comprehension [[lat,lon] for lon,lat in ...]
-    # yang membuat variabel 'lat' dan 'lon' di scope fungsi tertimpa nilai
-    # terakhir dari koordinat polygon → Map terpusat ke koordinat salah → peta kosong.
     center_lat, center_lon = center_loc
 
     m = folium.Map(
         location=[center_lat, center_lon],
-        zoom_start=14, tiles='OpenStreetMap', control_scale=True
+        zoom_start=14,
+        tiles='OpenStreetMap',
+        control_scale=True,
+        prefer_canvas=True   # FIX: prefer_canvas mempercepat render banyak marker
     )
 
+    # Marker titik analisis
     folium.Marker(
         [center_lat, center_lon],
         popup='<b>📍 Titik Analisis</b>',
@@ -550,57 +504,74 @@ def build_map(center_loc, zones, edu_fac, edges_dict):
         icon=folium.Icon(color='red', icon='bullseye', prefix='fa')
     ).add_to(m)
 
+    # Edge jalan (service area)
     if edges_dict:
         for tl, edges in edges_dict.items():
             edge_color = ZONE_COLORS.get(tl, '#90CAF9')
             for eg in edges:
                 try:
-                    # _ex/_ey: nama unik agar tidak shadow center_lat/center_lon
+                    # FIX: nama variabel _ex/_ey agar tidak shadow center_lat/lon
                     edge_pts = [[_ey, _ex] for _ex, _ey in eg.coords]
                     if len(edge_pts) >= 2:
-                        folium.PolyLine(edge_pts, color=edge_color, weight=1, opacity=0.25).add_to(m)
+                        folium.PolyLine(
+                            edge_pts, color=edge_color, weight=1, opacity=0.25
+                        ).add_to(m)
                 except:
                     continue
 
-    for tl, zd in zones.items():
+    # Zona aksesibilitas — dari luar ke dalam (besar ke kecil) agar tumpukan benar
+    for tl in sorted(zones.keys(), reverse=True):
+        zd = zones[tl]
         zone_color = ZONE_COLORS.get(tl, '#90CAF9')
         try:
             poly = zd['geometry']
             if poly is None or poly.is_empty:
                 raise ValueError("empty")
-            if poly.geom_type == 'Polygon' and len(list(poly.exterior.coords)) >= 3:
-                # BUG FIX: Gunakan _plat/_plon, BUKAN lat/lon
-                # Kode lama: [[lat,lon] for lon,lat in ...] → menimpa variabel loc
-                pts = [[_plat, _plon] for _plon, _plat in poly.exterior.coords]
-                folium.Polygon(
-                    pts, color=zone_color, fill=True,
-                    fill_color=zone_color, fill_opacity=0.3, weight=2,
-                    popup=(f"<b>{tl} menit</b><br>"
-                           f"Luas: {zd['area_sqkm']:.2f} km²<br>"
-                           f"Fasilitas: {zd['facilities_count']}"),
-                    tooltip=f"Zona {tl} menit"
-                ).add_to(m)
-            elif poly.geom_type == 'MultiPolygon':
-                for sub_p in poly.geoms:
-                    pts = [[_plat, _plon] for _plon, _plat in sub_p.exterior.coords]
+
+            def add_polygon(p):
+                # FIX: gunakan _plat/_plon agar tidak menimpa center_lat/center_lon
+                pts = [[_plat, _plon] for _plon, _plat in p.exterior.coords]
+                if len(pts) >= 3:
                     folium.Polygon(
-                        pts, color=zone_color, fill=True,
-                        fill_color=zone_color, fill_opacity=0.3, weight=2,
+                        pts,
+                        color=zone_color,
+                        fill=True,
+                        fill_color=zone_color,
+                        fill_opacity=0.3,
+                        weight=2,
+                        popup=folium.Popup(
+                            f"<b>Zona {tl} menit</b><br>"
+                            f"Luas: {zd['area_sqkm']:.2f} km²<br>"
+                            f"Fasilitas: {zd['facilities_count']}",
+                            max_width=200
+                        ),
                         tooltip=f"Zona {tl} menit"
                     ).add_to(m)
+
+            if poly.geom_type == 'Polygon':
+                add_polygon(poly)
+            elif poly.geom_type == 'MultiPolygon':
+                for sub_p in poly.geoms:
+                    add_polygon(sub_p)
             else:
                 raise ValueError("unknown type")
+
         except Exception:
-            # Fallback: Circle di titik pusat yang terjaga — center_lat/center_lon
+            # Fallback: lingkaran di center yang sudah aman
             folium.Circle(
                 [center_lat, center_lon],
-                radius=zd['max_distance'], color=zone_color,
-                fill=True, fill_color=zone_color, fill_opacity=0.3,
+                radius=zd['max_distance'],
+                color=zone_color,
+                fill=True,
+                fill_color=zone_color,
+                fill_opacity=0.3,
                 tooltip=f"Zona {tl} menit (estimasi)"
             ).add_to(m)
 
+    # Marker fasilitas pendidikan
     added = set()
-    for tl, zd in zones.items():
+    for tl in sorted(zones.keys()):
+        zd = zones[tl]
         for fac in zd.get('accessible_facilities', []):
             fkey = f"{fac['coordinates'][0]:.5f},{fac['coordinates'][1]:.5f}"
             if fkey in added:
@@ -611,16 +582,20 @@ def build_map(center_loc, zones, edu_fac, edges_dict):
                 folium.Marker(
                     fac['coordinates'],
                     popup=folium.Popup(
-                        f"<b>{fac['name']}</b><br>Jenjang: {fac['edu_type']}<br>"
-                        f"Jarak: {fac['distance_m']:.0f} m<br>Waktu: {fac['travel_time_min']:.1f} mnt",
-                        max_width=250),
+                        f"<b>{fac['name']}</b><br>"
+                        f"Jenjang: {fac['edu_type']}<br>"
+                        f"Jarak: {fac['distance_m']:.0f} m<br>"
+                        f"Waktu: {fac['travel_time_min']:.1f} mnt",
+                        max_width=250
+                    ),
                     tooltip=f"{fac['name']} ({fac['edu_type']})",
                     icon=folium.Icon(color=fcolor, icon=ficon, prefix='fa')
                 ).add_to(m)
             except Exception:
                 continue
 
-    legend = """
+    # Legend
+    legend_html = """
     <div style="position:fixed;bottom:50px;left:50px;width:210px;
                 background:white;border:2px solid grey;z-index:9999;
                 font-size:12px;padding:10px;border-radius:8px;opacity:0.95;">
@@ -638,7 +613,7 @@ def build_map(center_loc, zones, edu_fac, edges_dict):
     <div style="background:#2196F3;width:14px;height:10px;display:inline-block;border:1px solid #ccc"></div> 30 mnt &nbsp;
     <div style="background:#0D47A1;width:14px;height:10px;display:inline-block;border:1px solid #ccc"></div> 60 mnt
     </div>"""
-    m.get_root().html.add_child(folium.Element(legend))
+    m.get_root().html.add_child(folium.Element(legend_html))
     MiniMap(toggle_display=True).add_to(m)
     Fullscreen().add_to(m)
     return m
@@ -647,16 +622,33 @@ def build_map(center_loc, zones, edu_fac, edges_dict):
 # DISPLAY HASIL
 # ============================================================
 def show_results(loc, G, edu_fac, zones, edges_dict, method, speed, radius, time_limits, **kw):
-    tab1, tab2, tab3, tab4 = st.tabs(["🗺️ Peta","📊 Dashboard","🎓 Fasilitas","📈 Analisis"])
+    tab1, tab2, tab3, tab4 = st.tabs(["🗺️ Peta", "📊 Dashboard", "🎓 Fasilitas", "📈 Analisis"])
 
     with tab1:
         st.subheader("🗺️ Peta Jangkauan Fasilitas Pendidikan")
         st.info(f"**📍 Titik:** {loc[0]:.6f}, {loc[1]:.6f} | **Metode:** {method}")
+
+        # FIX: Bangun peta di luar blok try agar error lebih mudah ditangkap
+        map_obj = None
         try:
-            m = build_map(loc, zones, edu_fac, edges_dict)
-            folium_static(m, width=1200, height=620)
-        except Exception as map_err:
-            st.error(f"❌ Gagal render peta: {map_err}")
+            map_obj = build_map(loc, zones, edu_fac, edges_dict)
+        except Exception as build_err:
+            st.error(f"❌ Gagal membangun peta: {build_err}")
+
+        if map_obj is not None:
+            # FIX UTAMA: Gunakan st_folium (bukan folium_static yang deprecated)
+            # use_container_width=True → responsif, tidak hardcode 1200px
+            # key unik → agar tidak konflik antar reruns
+            st_folium(
+                map_obj,
+                use_container_width=True,
+                height=600,
+                key="main_map",
+                returned_objects=[]   # FIX: matikan callback agar tidak trigger rerun
+            )
+        else:
+            # Fallback peta sederhana
+            st.warning("⚠️ Menampilkan peta sederhana (fallback mode).")
             try:
                 m_fb = folium.Map(location=list(loc), zoom_start=14)
                 folium.Marker(list(loc), tooltip="Titik Analisis",
@@ -666,8 +658,8 @@ def show_results(loc, G, edu_fac, zones, edges_dict, method, speed, radius, time
                     folium.Circle(list(loc), radius=zd["max_distance"],
                                   color=zc, fill=True, fill_color=zc,
                                   fill_opacity=0.3, tooltip=f"Zona {tl} menit").add_to(m_fb)
-                folium_static(m_fb, width=1200, height=620)
-                st.warning("⚠️ Ditampilkan peta sederhana (fallback mode).")
+                st_folium(m_fb, use_container_width=True, height=600,
+                          key="fallback_map", returned_objects=[])
             except Exception as fb_err:
                 st.error(f"❌ Fallback peta gagal: {fb_err}")
 
@@ -749,9 +741,10 @@ def show_results(loc, G, edu_fac, zones, edges_dict, method, speed, radius, time
                         st.caption("Ringkasan per jenjang:")
                         st.dataframe(summ, use_container_width=True, hide_index=True)
                         csv = df.to_csv(index=False).encode('utf-8')
-                        st.download_button(f"📥 Download CSV zona {tl} menit", csv,
-                                           f"fasdik_{tl}mnt.csv", "text/csv",
-                                           key=f"dl_{tl}")
+                        st.download_button(
+                            f"📥 Download CSV zona {tl} menit", csv,
+                            f"fasdik_{tl}mnt.csv", "text/csv", key=f"dl_{tl}"
+                        )
                     else:
                         st.info("Tidak ada fasilitas dalam zona ini.")
         else:
@@ -797,10 +790,12 @@ def show_results(loc, G, edu_fac, zones, edges_dict, method, speed, radius, time
             'Luas_km2':           z['area_sqkm'],
             'Jumlah_fasilitas':   z['facilities_count']
         } for tl, z in zones.items()])
-        st.download_button("📥 Download Ringkasan CSV",
-                           summ.to_csv(index=False).encode('utf-8'),
-                           "ringkasan_aksesibilitas_pendidikan.csv",
-                           "text/csv", key="dl_summary")
+        st.download_button(
+            "📥 Download Ringkasan CSV",
+            summ.to_csv(index=False).encode('utf-8'),
+            "ringkasan_aksesibilitas_pendidikan.csv",
+            "text/csv", key="dl_summary"
+        )
 
 # ============================================================
 # HALAMAN WELCOME
@@ -934,7 +929,7 @@ elif not run_btn:
 st.markdown("---")
 st.markdown("""
 <div style='text-align:center;padding:15px;color:#7f8c8d;font-size:0.85em;'>
-🎓📍 <b>Aksesibilitas Fasilitas Pendidikan</b> v6.2 &nbsp;|&nbsp;
+🎓📍 <b>Aksesibilitas Fasilitas Pendidikan</b> v6.3 &nbsp;|&nbsp;
 Dijkstra + Concave Hull (Shapely) &nbsp;|&nbsp;
 Data: © OpenStreetMap contributors &nbsp;|&nbsp; 2026<br>
 Developer: <b>Adipandang Yudono, S.Si., MURP., PhD</b>
