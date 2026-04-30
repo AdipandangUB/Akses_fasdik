@@ -15,6 +15,8 @@ from folium.plugins import MiniMap, Fullscreen
 import warnings
 import time
 import math
+import tempfile
+import os
 
 warnings.filterwarnings('ignore')
 
@@ -381,7 +383,7 @@ def to_wgs84(polygon, crs, fallback_loc):
 
 
 # ============================================================
-# BUILD MAP
+# BUILD MAP - PERBAIKAN UTAMA
 # ============================================================
 ZONE_COLORS = {
     5: '#E3F2FD', 10: '#BBDEFB', 15: '#90CAF9', 20: '#64B5F6',
@@ -389,15 +391,15 @@ ZONE_COLORS = {
 }
 
 
-def build_map_html(center_loc, zones, edu_fac, edges_dict):
+def create_folium_map(center_loc, zones, edu_fac, edges_dict):
+    """Buat objek folium.Map (bukan HTML string)"""
     clat, clon = center_loc
 
     m = folium.Map(
         location=[clat, clon],
-        zoom_start=14,
+        zoom_start=13,
         tiles='OpenStreetMap',
-        control_scale=True,
-        prefer_canvas=True
+        control_scale=True
     )
 
     # Marker titik analisis
@@ -408,15 +410,16 @@ def build_map_html(center_loc, zones, edu_fac, edges_dict):
         icon=folium.Icon(color='red', icon='bullseye', prefix='fa')
     ).add_to(m)
 
-    # Edge jalan
+    # Edge jalan jika ada
     if edges_dict:
         for tl, edges in edges_dict.items():
             ec = ZONE_COLORS.get(tl, '#90CAF9')
             for eg in edges:
                 try:
-                    pts = [[ey, ex] for ex, ey in eg.coords]
-                    if len(pts) >= 2:
-                        folium.PolyLine(pts, color=ec, weight=1, opacity=0.25).add_to(m)
+                    if hasattr(eg, 'coords'):
+                        pts = [[lat, lon] for lon, lat in eg.coords]
+                        if len(pts) >= 2:
+                            folium.PolyLine(pts, color=ec, weight=2, opacity=0.4).add_to(m)
                 except:
                     continue
 
@@ -429,86 +432,138 @@ def build_map_html(center_loc, zones, edu_fac, edges_dict):
             poly = zd['geometry']
             if poly is None or poly.is_empty:
                 raise ValueError
-
-            def add_poly(p):
-                pts = [[py, px] for px, py in p.exterior.coords]
-                if len(pts) >= 3:
+            
+            # Konversi ke koordinat untuk folium
+            if poly.geom_type == 'Polygon':
+                coords = [[lat, lon] for lon, lat in poly.exterior.coords]
+                folium.Polygon(
+                    coords,
+                    color=zc,
+                    fill=True,
+                    fill_color=zc,
+                    fill_opacity=0.3,
+                    weight=2,
+                    popup=folium.Popup(
+                        f"<b>Zona {tl} menit</b><br>"
+                        f"Luas: {zd['area_sqkm']:.2f} km²<br>"
+                        f"Fasilitas: {zd['facilities_count']}",
+                        max_width=200
+                    ),
+                    tooltip=f"Zona {tl} menit"
+                ).add_to(m)
+            elif poly.geom_type == 'MultiPolygon':
+                for polygon in poly.geoms:
+                    coords = [[lat, lon] for lon, lat in polygon.exterior.coords]
                     folium.Polygon(
-                        pts, color=zc, fill=True, fill_color=zc,
-                        fill_opacity=0.3, weight=2,
-                        popup=folium.Popup(
-                            f"<b>Zona {tl} menit</b><br>"
-                            f"Luas: {zd['area_sqkm']:.2f} km²<br>"
-                            f"Fasilitas: {zd['facilities_count']}",
-                            max_width=200
-                        ),
+                        coords,
+                        color=zc,
+                        fill=True,
+                        fill_color=zc,
+                        fill_opacity=0.3,
+                        weight=2,
                         tooltip=f"Zona {tl} menit"
                     ).add_to(m)
-
-            if poly.geom_type == 'Polygon':
-                add_poly(poly)
-            elif poly.geom_type == 'MultiPolygon':
-                for sp in poly.geoms:
-                    add_poly(sp)
-            else:
-                raise ValueError
-        except:
+        except Exception as e:
+            # Fallback: menggunakan lingkaran
             folium.Circle(
-                [clat, clon], radius=zd['max_distance'],
-                color=zc, fill=True, fill_color=zc, fill_opacity=0.3,
+                [clat, clon],
+                radius=zd['max_distance'],
+                color=zc,
+                fill=True,
+                fill_color=zc,
+                fill_opacity=0.3,
                 tooltip=f"Zona {tl} menit (estimasi)"
             ).add_to(m)
 
-    # Marker fasilitas
-    added = set()
-    for tl in sorted(zones.keys()):
-        for fac in zones[tl].get('accessible_facilities', []):
-            fkey = f"{fac['coordinates'][0]:.5f},{fac['coordinates'][1]:.5f}"
-            if fkey in added:
-                continue
-            added.add(fkey)
-            fc, fi = EDU_MARKER.get(fac['edu_type'], ('gray', 'info-circle'))
-            
+    # Marker fasilitas pendidikan
+    if edu_fac is not None and not edu_fac.empty:
+        for idx, row in edu_fac.iterrows():
             try:
-                folium.Marker(
-                    fac['coordinates'],
-                    popup=folium.Popup(
-                        f"<b>{fac['name']}</b><br>"
-                        f"Jenjang: {fac['edu_type']}<br>"
-                        f"Jarak: {fac['distance_m']:.0f} m<br>"
-                        f"Waktu: {fac['travel_time_min']:.1f} mnt",
-                        max_width=250
-                    ),
-                    tooltip=f"{fac['name']} ({fac['edu_type']})",
-                    icon=folium.Icon(color=fc, icon=fi, prefix='fa')
-                ).add_to(m)
-            except:
+                if 'centroid_geom' in row and row['centroid_geom'] is not None:
+                    geom = row['centroid_geom']
+                    lat, lon = geom.y, geom.x
+                    edu_type = row.get('edu_type', 'Lainnya')
+                    name = row.get('name', 'Fasilitas Pendidikan')
+                    
+                    fc, fi = EDU_MARKER.get(edu_type, ('gray', 'info-circle'))
+                    
+                    # Cek apakah fasilitas berada dalam zona
+                    in_zone = False
+                    for tl, zd in zones.items():
+                        for fac in zd.get('accessible_facilities', []):
+                            if abs(fac['coordinates'][0] - lat) < 0.0001 and abs(fac['coordinates'][1] - lon) < 0.0001:
+                                in_zone = True
+                                break
+                        if in_zone:
+                            break
+                    
+                    if in_zone:
+                        folium.Marker(
+                            [lat, lon],
+                            popup=folium.Popup(
+                                f"<b>{name[:50]}</b><br>"
+                                f"Jenjang: {edu_type}",
+                                max_width=250
+                            ),
+                            tooltip=f"{name[:30]} ({edu_type})",
+                            icon=folium.Icon(color=fc, icon=fi, prefix='fa')
+                        ).add_to(m)
+            except Exception as e:
                 continue
 
     # Legend
-    m.get_root().html.add_child(folium.Element("""
-    <div style="position:fixed;bottom:50px;left:50px;width:210px;
-                background:white;border:2px solid grey;z-index:9999;
-                font-size:12px;padding:10px;border-radius:8px;opacity:0.95;">
-    <b>LEGENDA</b><br>
-    <i class="fa fa-bullseye" style="color:red"></i> Titik Analisis<br>
-    <i class="fa fa-graduation-cap" style="color:blue"></i> SD<br>
-    <i class="fa fa-book" style="color:green"></i> SMP<br>
-    <i class="fa fa-certificate" style="color:orange"></i> SMA/SMK<br>
-    <i class="fa fa-university" style="color:red"></i> Universitas<br>
-    <i class="fa fa-building" style="color:purple"></i> Sekolah Tinggi<br>
-    <i class="fa fa-pencil" style="color:cadetblue"></i> Lembaga Kursus<br>
-    <hr style="margin:4px 0">
-    <div style="background:#E3F2FD;width:14px;height:10px;display:inline-block;border:1px solid #ccc"></div> 5 mnt &nbsp;
-    <div style="background:#90CAF9;width:14px;height:10px;display:inline-block;border:1px solid #ccc"></div> 15 mnt<br>
-    <div style="background:#2196F3;width:14px;height:10px;display:inline-block;border:1px solid #ccc"></div> 30 mnt &nbsp;
-    <div style="background:#0D47A1;width:14px;height:10px;display:inline-block;border:1px solid #ccc"></div> 60 mnt
-    </div>"""))
+    legend_html = '''
+    <div style="position: fixed; bottom: 50px; left: 50px; z-index: 1000;
+                background-color: white; padding: 10px; border: 2px solid grey;
+                border-radius: 8px; font-size: 12px; opacity: 0.95;">
+        <b>LEGENDA</b><br>
+        <i class="fa fa-bullseye" style="color:red"></i> Titik Analisis<br>
+        <i class="fa fa-graduation-cap" style="color:blue"></i> SD<br>
+        <i class="fa fa-book" style="color:green"></i> SMP<br>
+        <i class="fa fa-certificate" style="color:orange"></i> SMA/SMK<br>
+        <i class="fa fa-university" style="color:red"></i> Universitas<br>
+        <i class="fa fa-building" style="color:purple"></i> Sekolah Tinggi<br>
+        <i class="fa fa-pencil" style="color:cadetblue"></i> Lembaga Kursus<br>
+        <hr style="margin: 4px 0">
+        <div style="background:#E3F2FD;width:14px;height:10px;display:inline-block;border:1px solid #ccc"></div> 5 mnt &nbsp;
+        <div style="background:#90CAF9;width:14px;height:10px;display:inline-block;border:1px solid #ccc"></div> 15 mnt<br>
+        <div style="background:#2196F3;width:14px;height:10px;display:inline-block;border:1px solid #ccc"></div> 30 mnt &nbsp;
+        <div style="background:#0D47A1;width:14px;height:10px;display:inline-block;border:1px solid #ccc"></div> 60 mnt
+    </div>
+    '''
     
+    m.get_root().html.add_child(folium.Element(legend_html))
     MiniMap(toggle_display=True).add_to(m)
     Fullscreen().add_to(m)
+    
+    return m
 
-    return m._repr_html_()
+
+def render_map(center_loc, zones, edu_fac, edges_dict):
+    """Render peta menggunakan komponen HTML"""
+    try:
+        # Buat objek map
+        m = create_folium_map(center_loc, zones, edu_fac, edges_dict)
+        
+        # Simpan ke file HTML temporary
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.html') as tmpfile:
+            m.save(tmpfile.name)
+            tmpfile_path = tmpfile.name
+        
+        # Baca file HTML
+        with open(tmpfile_path, 'r', encoding='utf-8') as f:
+            html_content = f.read()
+        
+        # Hapus file temporary
+        os.unlink(tmpfile_path)
+        
+        # Render HTML dengan tinggi yang cukup
+        components.html(html_content, height=600, width=None, scrolling=False)
+        
+        return True
+    except Exception as e:
+        st.error(f"Error rendering map: {str(e)}")
+        return False
 
 
 # ============================================================
@@ -590,7 +645,7 @@ def run_analysis(location_point, network_type, speed_kmh, radius_m,
         if poly_wgs and not poly_wgs.is_empty:
             facs = []
             if not edu_fac.empty:
-                for _, row in edu_fac.iterrows():
+                for idx, row in edu_fac.iterrows():
                     try:
                         cgeom = row.get('centroid_geom')
                         if cgeom is None or cgeom.is_empty:
@@ -623,15 +678,8 @@ def run_analysis(location_point, network_type, speed_kmh, radius_m,
         pb.progress(50 + int((i + 1) * 50 / len(time_limits_min)))
 
     pb.progress(100)
-    status.text("✅ Selesai! Membangun peta...")
-
-    try:
-        map_html = build_map_html(location_point, zones, edu_fac, edges_dict)
-        st.session_state.map_html = map_html
-    except Exception as e:
-        st.warning(f"⚠️ Gagal build peta: {e}")
-        st.session_state.map_html = None
-
+    status.text("✅ Selesai!")
+    
     time.sleep(0.5)
     status.empty()
     pb.empty()
@@ -648,49 +696,6 @@ def run_analysis(location_point, network_type, speed_kmh, radius_m,
 
 
 # ============================================================
-# RENDER PETA
-# ============================================================
-def render_map(center_loc, zones, edu_fac, edges_dict):
-    html = st.session_state.get('map_html')
-
-    if html is None:
-        with st.spinner("🗺️ Membangun peta..."):
-            try:
-                html = build_map_html(center_loc, zones, edu_fac, edges_dict)
-                st.session_state.map_html = html
-            except Exception as e:
-                st.error(f"❌ Gagal membangun peta: {e}")
-                html = None
-
-    if html:
-        wrapped = f"""
-        <div style="width:100%;height:650px;border-radius:8px;overflow:hidden;border:1px solid #ddd;">
-            {html}
-        </div>
-        """
-        components.html(wrapped, height=660, scrolling=False)
-    else:
-        clat, clon = center_loc
-        m_fb = folium.Map(location=[clat, clon], zoom_start=13)
-        folium.Marker([clat, clon], tooltip="Titik Analisis",
-                      icon=folium.Icon(color="red")).add_to(m_fb)
-        
-        for tl, zd in zones.items():
-            zc = ZONE_COLORS.get(tl, "#90CAF9")
-            folium.Circle([clat, clon], radius=zd["max_distance"],
-                          color=zc, fill=True, fill_color=zc,
-                          fill_opacity=0.3, tooltip=f"Zona {tl} menit").add_to(m_fb)
-        
-        fb_html = f"""
-        <div style="width:100%;height:650px;border-radius:8px;overflow:hidden;">
-            {m_fb._repr_html_()}
-        </div>
-        """
-        components.html(fb_html, height=660, scrolling=False)
-        st.caption("⚠️ Menampilkan peta sederhana (fallback mode).")
-
-
-# ============================================================
 # DISPLAY HASIL
 # ============================================================
 def show_results(loc, G, edu_fac, zones, edges_dict, method, speed, radius, time_limits, **kw):
@@ -699,13 +704,20 @@ def show_results(loc, G, edu_fac, zones, edges_dict, method, speed, radius, time
     with tab1:
         st.subheader("🗺️ Peta Jangkauan Fasilitas Pendidikan")
         st.info(f"**📍 Titik:** {loc[0]:.6f}, {loc[1]:.6f} | **Metode:** {method}")
-        render_map(loc, zones, edu_fac, edges_dict)
+        
+        # Render peta
+        if zones:
+            success = render_map(loc, zones, edu_fac, edges_dict)
+            if not success:
+                st.warning("Peta tidak dapat ditampilkan. Silakan coba lagi.")
+        else:
+            st.warning("Tidak ada zona yang dihasilkan untuk ditampilkan.")
 
     with tab2:
         st.subheader("📊 Dashboard")
         c1, c2, c3, c4 = st.columns(4)
         with c1:
-            st.metric("🎓 Total Fasilitas di Area", edu_fac.shape[0] if not edu_fac.empty else 0)
+            st.metric("🎓 Total Fasilitas di Area", edu_fac.shape[0] if edu_fac is not None and not edu_fac.empty else 0)
         with c2:
             st.metric("⚡ Kecepatan", f"{speed} km/jam")
         with c3:
@@ -713,7 +725,7 @@ def show_results(loc, G, edu_fac, zones, edges_dict, method, speed, radius, time
         with c4:
             st.metric("🔍 Metode", method)
 
-        if not edu_fac.empty and 'edu_type' in edu_fac.columns:
+        if edu_fac is not None and not edu_fac.empty and 'edu_type' in edu_fac.columns:
             st.subheader("Distribusi Jenis Fasilitas dalam Area Pencarian")
             tc = edu_fac['edu_type'].value_counts().reset_index()
             tc.columns = ['Jenjang', 'Jumlah']
@@ -760,13 +772,13 @@ def show_results(loc, G, edu_fac, zones, edges_dict, method, speed, radius, time
 
     with tab3:
         st.subheader("🎓 Daftar Fasilitas yang Dapat Diakses")
-        any_fac = any(z['accessible_facilities'] for z in zones.values())
+        any_fac = any(z.get('accessible_facilities', []) for z in zones.values())
         
         if any_fac:
             for tl in sorted(time_limits):
                 if tl not in zones:
                     continue
-                facs = zones[tl]['accessible_facilities']
+                facs = zones[tl].get('accessible_facilities', [])
                 with st.expander(f"Zona {tl} menit — {len(facs)} fasilitas", expanded=False):
                     if facs:
                         df = pd.DataFrame([{
@@ -777,14 +789,16 @@ def show_results(loc, G, edu_fac, zones, edges_dict, method, speed, radius, time
                             "Waktu": f"{f['travel_time_min']:.1f} mnt"
                         } for f in facs])
                         st.dataframe(df, use_container_width=True, hide_index=True)
-                        summ = df.groupby('Jenjang').size().reset_index(name='Jumlah')
-                        st.caption("Ringkasan per jenjang:")
-                        st.dataframe(summ, use_container_width=True, hide_index=True)
-                        st.download_button(
-                            f"📥 Download CSV zona {tl} menit",
-                            df.to_csv(index=False).encode('utf-8'),
-                            f"fasdik_{tl}mnt.csv", "text/csv", key=f"dl_{tl}"
-                        )
+                        
+                        if len(df) > 0:
+                            summ = df.groupby('Jenjang').size().reset_index(name='Jumlah')
+                            st.caption("Ringkasan per jenjang:")
+                            st.dataframe(summ, use_container_width=True, hide_index=True)
+                            st.download_button(
+                                f"📥 Download CSV zona {tl} menit",
+                                df.to_csv(index=False).encode('utf-8'),
+                                f"fasdik_{tl}mnt.csv", "text/csv", key=f"dl_{tl}"
+                            )
                     else:
                         st.info("Tidak ada fasilitas dalam zona ini.")
         else:
@@ -792,7 +806,7 @@ def show_results(loc, G, edu_fac, zones, edges_dict, method, speed, radius, time
 
     with tab4:
         st.subheader("📈 Visualisasi Lanjutan")
-        all_facs = [f for z in zones.values() for f in z['accessible_facilities']]
+        all_facs = [f for z in zones.values() for f in z.get('accessible_facilities', [])]
         
         if all_facs:
             times = [f['travel_time_min'] for f in all_facs]
@@ -812,15 +826,17 @@ def show_results(loc, G, edu_fac, zones, edges_dict, method, speed, radius, time
             for f in all_facs:
                 type_cnt[f['edu_type']] = type_cnt.get(f['edu_type'], 0) + 1
             
-            fig3, ax3 = plt.subplots(figsize=(10, 4))
-            ax3.bar(list(type_cnt.keys()), list(type_cnt.values()),
-                    color=plt.cm.Set2(np.linspace(0, 1, len(type_cnt))), edgecolor='black')
-            ax3.set_title('Distribusi Fasilitas per Jenjang', fontweight='bold')
-            ax3.set_xlabel('Jenjang')
-            ax3.set_ylabel('Jumlah')
-            ax3.grid(axis='y', alpha=0.3)
-            plt.tight_layout()
-            st.pyplot(fig3)
+            if type_cnt:
+                fig3, ax3 = plt.subplots(figsize=(10, 4))
+                ax3.bar(list(type_cnt.keys()), list(type_cnt.values()),
+                        color=plt.cm.Set2(np.linspace(0, 1, len(type_cnt))), edgecolor='black')
+                ax3.set_title('Distribusi Fasilitas per Jenjang', fontweight='bold')
+                ax3.set_xlabel('Jenjang')
+                ax3.set_ylabel('Jumlah')
+                ax3.grid(axis='y', alpha=0.3)
+                plt.xticks(rotation=45, ha='right')
+                plt.tight_layout()
+                st.pyplot(fig3)
 
             fig4, ax4 = plt.subplots(figsize=(10, 4))
             ax4.hist(times, bins=15, color='steelblue', edgecolor='black', alpha=0.7)
@@ -834,20 +850,21 @@ def show_results(loc, G, edu_fac, zones, edges_dict, method, speed, radius, time
             st.info("Tidak ada data fasilitas untuk divisualisasikan.")
 
         st.subheader("💾 Ekspor Ringkasan")
-        summ = pd.DataFrame([{
-            'Waktu_menit': tl,
-            'Metode': z['calculation_method'],
-            'Jarak_maks_m': z['max_distance'],
-            'Luas_km2': z['area_sqkm'],
-            'Jumlah_fasilitas': z['facilities_count']
-        } for tl, z in zones.items()])
-        
-        st.download_button(
-            "📥 Download Ringkasan CSV",
-            summ.to_csv(index=False).encode('utf-8'),
-            "ringkasan_aksesibilitas_pendidikan.csv",
-            "text/csv", key="dl_summary"
-        )
+        if zones:
+            summ = pd.DataFrame([{
+                'Waktu_menit': tl,
+                'Metode': z.get('calculation_method', method),
+                'Jarak_maks_m': z.get('max_distance', 0),
+                'Luas_km2': z.get('area_sqkm', 0),
+                'Jumlah_fasilitas': z.get('facilities_count', 0)
+            } for tl, z in zones.items()])
+            
+            st.download_button(
+                "📥 Download Ringkasan CSV",
+                summ.to_csv(index=False).encode('utf-8'),
+                "ringkasan_aksesibilitas_pendidikan.csv",
+                "text/csv", key="dl_summary"
+            )
 
 
 # ============================================================
@@ -921,7 +938,7 @@ with st.sidebar:
                           index=2, key="mode_id")
     net_type = convert_mode(mode_id)
     speed = st.slider("Kecepatan (km/jam):", 1.0, 100.0, default_speed(mode_id), 0.5, key="speed")
-    radius = st.slider("Radius Pencarian (m):", 500, 20000, 2000, 100, key="radius")
+    radius = st.slider("Radius Pencarian (m):", 500, 20000, 5000, 100, key="radius")
     t_limits = st.multiselect("Batas Waktu (menit):", [5, 10, 15, 20, 25, 30, 45, 60], 
                              default=[15, 25], key="t_limits")
     method = st.selectbox("Metode Coverage:", ["Service Area", "Buffer dari Titik"], key="method")
