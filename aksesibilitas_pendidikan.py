@@ -1,5 +1,5 @@
 import streamlit as st
-from streamlit_folium import folium_static
+import streamlit.components.v1 as components
 import osmnx as ox
 import networkx as nx
 import geopandas as gpd
@@ -15,6 +15,8 @@ from folium.plugins import MiniMap, Fullscreen
 import warnings
 import time
 import math
+import tempfile
+import os
 
 warnings.filterwarnings('ignore')
 
@@ -30,6 +32,7 @@ _defaults = {
     'analysis_params': None,
     'analysis_in_progress': False,
     'network_cache': {},
+    'map_html': None,
 }
 
 for k, v in _defaults.items():
@@ -301,7 +304,7 @@ def calc_service_area(G, start_node, start_coords, max_dist, service_buffer=100)
             try:
                 from shapely.geometry import MultiPoint
                 mp = MultiPoint([(x, y) for x, y in unique_pts])
-                for ratio in [0.05, 0.1, 0.2, 0.3, 0.5]:
+                for ratio in [0.05, 0.1, 0.2, 0.3]:
                     candidate = concave_hull(mp, ratio=ratio)
                     if candidate and not candidate.is_empty and candidate.geom_type == 'Polygon':
                         area = candidate
@@ -380,7 +383,7 @@ def to_wgs84(polygon, crs, fallback_loc):
 
 
 # ============================================================
-# BUILD MAP - MENGGUNAKAN STREAMLIT-FOLIUM
+# BUILD MAP - PERBAIKAN UTAMA
 # ============================================================
 ZONE_COLORS = {
     5: '#E3F2FD', 10: '#BBDEFB', 15: '#90CAF9', 20: '#64B5F6',
@@ -389,7 +392,7 @@ ZONE_COLORS = {
 
 
 def create_folium_map(center_loc, zones, edu_fac, edges_dict):
-    """Buat objek folium.Map"""
+    """Buat objek folium.Map (bukan HTML string)"""
     clat, clon = center_loc
 
     m = folium.Map(
@@ -433,7 +436,24 @@ def create_folium_map(center_loc, zones, edu_fac, edges_dict):
             # Konversi ke koordinat untuk folium
             if poly.geom_type == 'Polygon':
                 coords = [[lat, lon] for lon, lat in poly.exterior.coords]
-                if len(coords) >= 3:
+                folium.Polygon(
+                    coords,
+                    color=zc,
+                    fill=True,
+                    fill_color=zc,
+                    fill_opacity=0.3,
+                    weight=2,
+                    popup=folium.Popup(
+                        f"<b>Zona {tl} menit</b><br>"
+                        f"Luas: {zd['area_sqkm']:.2f} km²<br>"
+                        f"Fasilitas: {zd['facilities_count']}",
+                        max_width=200
+                    ),
+                    tooltip=f"Zona {tl} menit"
+                ).add_to(m)
+            elif poly.geom_type == 'MultiPolygon':
+                for polygon in poly.geoms:
+                    coords = [[lat, lon] for lon, lat in polygon.exterior.coords]
                     folium.Polygon(
                         coords,
                         color=zc,
@@ -441,27 +461,8 @@ def create_folium_map(center_loc, zones, edu_fac, edges_dict):
                         fill_color=zc,
                         fill_opacity=0.3,
                         weight=2,
-                        popup=folium.Popup(
-                            f"<b>Zona {tl} menit</b><br>"
-                            f"Luas: {zd['area_sqkm']:.2f} km²<br>"
-                            f"Fasilitas: {zd['facilities_count']}",
-                            max_width=200
-                        ),
                         tooltip=f"Zona {tl} menit"
                     ).add_to(m)
-            elif poly.geom_type == 'MultiPolygon':
-                for polygon in poly.geoms:
-                    coords = [[lat, lon] for lon, lat in polygon.exterior.coords]
-                    if len(coords) >= 3:
-                        folium.Polygon(
-                            coords,
-                            color=zc,
-                            fill=True,
-                            fill_color=zc,
-                            fill_opacity=0.3,
-                            weight=2,
-                            tooltip=f"Zona {tl} menit"
-                        ).add_to(m)
         except Exception as e:
             # Fallback: menggunakan lingkaran
             folium.Circle(
@@ -536,6 +537,33 @@ def create_folium_map(center_loc, zones, edu_fac, edges_dict):
     Fullscreen().add_to(m)
     
     return m
+
+
+def render_map(center_loc, zones, edu_fac, edges_dict):
+    """Render peta menggunakan komponen HTML"""
+    try:
+        # Buat objek map
+        m = create_folium_map(center_loc, zones, edu_fac, edges_dict)
+        
+        # Simpan ke file HTML temporary
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.html') as tmpfile:
+            m.save(tmpfile.name)
+            tmpfile_path = tmpfile.name
+        
+        # Baca file HTML
+        with open(tmpfile_path, 'r', encoding='utf-8') as f:
+            html_content = f.read()
+        
+        # Hapus file temporary
+        os.unlink(tmpfile_path)
+        
+        # Render HTML dengan tinggi yang cukup
+        components.html(html_content, height=600, width=None, scrolling=False)
+        
+        return True
+    except Exception as e:
+        st.error(f"Error rendering map: {str(e)}")
+        return False
 
 
 # ============================================================
@@ -677,26 +705,11 @@ def show_results(loc, G, edu_fac, zones, edges_dict, method, speed, radius, time
         st.subheader("🗺️ Peta Jangkauan Fasilitas Pendidikan")
         st.info(f"**📍 Titik:** {loc[0]:.6f}, {loc[1]:.6f} | **Metode:** {method}")
         
-        # Render peta menggunakan streamlit-folium
+        # Render peta
         if zones:
-            with st.spinner("🗺️ Membuat peta..."):
-                try:
-                    m = create_folium_map(loc, zones, edu_fac, edges_dict)
-                    folium_static(m, width=1100, height=600)
-                except Exception as e:
-                    st.error(f"Error membuat peta: {str(e)}")
-                    st.info("Coba gunakan metode 'Buffer dari Titik' untuk menampilkan peta sederhana")
-                    
-                    # Fallback: tampilkan peta sederhana dengan lingkaran
-                    m_simple = folium.Map(location=[loc[0], loc[1]], zoom_start=13)
-                    folium.Marker([loc[0], loc[1]], tooltip="Titik Analisis",
-                                  icon=folium.Icon(color="red")).add_to(m_simple)
-                    for tl, zd in zones.items():
-                        zc = ZONE_COLORS.get(tl, "#90CAF9")
-                        folium.Circle([loc[0], loc[1]], radius=zd['max_distance'],
-                                      color=zc, fill=True, fill_color=zc,
-                                      fill_opacity=0.3, tooltip=f"Zona {tl} menit").add_to(m_simple)
-                    folium_static(m_simple, width=1100, height=600)
+            success = render_map(loc, zones, edu_fac, edges_dict)
+            if not success:
+                st.warning("Peta tidak dapat ditampilkan. Silakan coba lagi.")
         else:
             st.warning("Tidak ada zona yang dihasilkan untuk ditampilkan.")
 
@@ -1006,5 +1019,4 @@ st.markdown("""
     color:white!important;
 }
 [data-testid="stSidebar"]{background:linear-gradient(180deg,#e3f2fd,#bbdefb);}
-.stAlert{background-color:#f8f9fa;border-left:4px solid #1565C0;}
 </style>""", unsafe_allow_html=True)
